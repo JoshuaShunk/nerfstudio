@@ -790,18 +790,18 @@ def populate_render_tab(
             return
         time = None
         if len(maybe_pose_and_fov_rad) == 3:  # Time is enabled.
-            pose, fov_rad, time = maybe_pose_and_fov_rad
+            pose, fov, time = maybe_pose_and_fov_rad
             render_tab_state.preview_time = time
         else:
-            pose, fov_rad = maybe_pose_and_fov_rad
-        render_tab_state.preview_fov = fov_rad
+            pose, fov = maybe_pose_and_fov_rad
+        render_tab_state.preview_fov = fov
         render_tab_state.preview_aspect = camera_path.get_aspect()
         render_tab_state.preview_camera_type = camera_type.value
 
         if time is not None:
-            return pose, fov_rad, time
+            return pose, fov, time
         else:
-            return pose, fov_rad
+            return pose, fov
 
     def add_preview_frame_slider() -> Optional[viser.GuiInputHandle[int]]:
         """Helper for creating the current frame # slider. This is removed and
@@ -828,13 +828,13 @@ def populate_render_tab(
             if maybe_pose_and_fov_rad is None:
                 return
             if len(maybe_pose_and_fov_rad) == 3:  # Time is enabled.
-                pose, fov_rad, time = maybe_pose_and_fov_rad
+                pose, fov, time = maybe_pose_and_fov_rad
             else:
-                pose, fov_rad = maybe_pose_and_fov_rad
+                pose, fov = maybe_pose_and_fov_rad
 
             preview_camera_handle = server.scene.add_camera_frustum(
                 "/preview_camera",
-                fov=fov_rad,
+                fov=fov,
                 aspect=resolution.value[0] / resolution.value[1],
                 scale=0.35,
                 wxyz=pose.rotation().wxyz,
@@ -1020,13 +1020,6 @@ def populate_render_tab(
         initial_value=now.strftime("%Y-%m-%d-%H-%M-%S"),
         hint="Name of the render",
     )
-    render_button = server.gui.add_button(
-        "Generate Command",
-        color="green",
-        icon=viser.Icon.FILE_EXPORT,
-        hint="Generate the ns-render command for rendering the camera path.",
-    )
-
     reset_up_button = server.gui.add_button(
         "Reset Up Direction",
         icon=viser.Icon.ARROW_BIG_UP_LINES,
@@ -1038,6 +1031,146 @@ def populate_render_tab(
     def _(event: viser.GuiEvent) -> None:
         assert event.client is not None
         event.client.camera.up_direction = tf.SO3(event.client.camera.wxyz) @ np.array([0.0, -1.0, 0.0])
+
+    # Add button for capturing and saving a single frame
+    capture_frame_button = server.gui.add_button(
+        "Capture Single Frame",
+        icon=viser.Icon.CAMERA,
+        color="teal",
+        hint="Capture and save a single frame from the current camera view."
+    )
+
+    # Add depth options folder
+    depth_folder = server.gui.add_folder("Depth Output Options")
+    with depth_folder:
+        output_depth = server.gui.add_checkbox(
+            "Save depth image",
+            initial_value=True,
+            hint="Whether to save depth images alongside RGB."
+        )
+        output_depth_exr = server.gui.add_checkbox(
+            "Save depth as OpenEXR",
+            initial_value=False,
+            hint="Save depth in OpenEXR format (requires OpenEXR package)."
+        )
+
+    @capture_frame_button.on_click
+    def _(event: viser.GuiEvent) -> None:
+        import subprocess
+        import os
+        from pathlib import Path
+        
+        assert event.client is not None
+        
+        # Get the current camera's position and rotation
+        camera = event.client.camera
+        position = camera.position.tolist()
+        wxyz = camera.wxyz.tolist()
+        
+        # Format the camera pose as x,y,z,qx,qy,qz,qw
+        camera_pose = f"{position[0]},{position[1]},{position[2]},{wxyz[1]},{wxyz[2]},{wxyz[3]},{wxyz[0]}"
+        
+        # Get the current FOV in degrees
+        fov_degrees = np.degrees(camera.fov).item()
+        
+        # Create output directory
+        now = datetime.datetime.now()
+        output_dir = Path("renders/single_frame") / now.strftime("%Y-%m-%d-%H-%M-%S")
+        
+        # Create a modal dialog for progress
+        with event.client.gui.add_modal("Capturing Frame") as modal:
+            event.client.gui.add_markdown("Capturing and saving frame...")
+            
+            # Define the command execution function
+            def run_render_command():
+                try:
+                    # Check if config path exists
+                    if not os.path.exists(config_path):
+                        # Show error message if config path doesn't exist
+                        with event.client.gui.add_modal("Error") as error_modal:
+                            event.client.gui.add_markdown("Could not find training config. Please make sure you've trained a model first.")
+                            close_button = event.client.gui.add_button("Close")
+                            
+                            @close_button.on_click
+                            def _(_): 
+                                error_modal.close()
+                        return
+                    
+                    # Get the resolution - could be a tuple or string depending on implementation
+                    render_width, render_height = None, None
+                    try:
+                        # Try tuple approach first
+                        render_width = resolution.value[0]
+                        render_height = resolution.value[1]
+                    except (TypeError, IndexError):
+                        # Try string approach as fallback
+                        try:
+                            width_str, height_str = resolution.value.split("x")
+                            render_width = int(width_str)
+                            render_height = int(height_str)
+                        except (ValueError, AttributeError):
+                            # Show error if resolution format is invalid
+                            with event.client.gui.add_modal("Error") as error_modal:
+                                event.client.gui.add_markdown("Invalid resolution format.")
+                                close_button = event.client.gui.add_button("Close")
+                                
+                                @close_button.on_click
+                                def _(_): 
+                                    error_modal.close()
+                            return
+                    
+                    resolution_str = f"{render_width}x{render_height}"
+                    
+                    # Build the command
+                    cmd = [
+                        "python", "-m", "nerfstudio.scripts.render", "single-frame",
+                        "--load-config", str(config_path),
+                        "--camera-pose", camera_pose,
+                        "--camera-fov", str(fov_degrees),
+                        "--resolution", resolution_str,
+                        "--output-path", str(output_dir),
+                        "--output-depth", str(output_depth.value),
+                        "--output-depth-exr", str(output_depth_exr.value),
+                    ]
+                    
+                    # Run the command
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                    # Show result message
+                    if result.returncode == 0:
+                        with event.client.gui.add_modal("Success") as success_modal:
+                            event.client.gui.add_markdown(f"Frame captured and saved to {output_dir}")
+                            close_button = event.client.gui.add_button("Close")
+                            
+                            @close_button.on_click
+                            def _(_): 
+                                success_modal.close()
+                    else:
+                        with event.client.gui.add_modal("Error") as error_modal:
+                            event.client.gui.add_markdown("Error capturing frame: " + result.stderr)
+                            close_button = event.client.gui.add_button("Close")
+                            
+                            @close_button.on_click
+                            def _(_): 
+                                error_modal.close()
+                except Exception as e:
+                    with event.client.gui.add_modal("Error") as error_modal:
+                        event.client.gui.add_markdown(f"An error occurred: {str(e)}")
+                        close_button = event.client.gui.add_button("Close")
+                        
+                        @close_button.on_click
+                        def _(_): 
+                            error_modal.close()
+            
+            # Start the render thread
+            threading.Thread(target=run_render_command).start()
+
+    render_button = server.gui.add_button(
+        "Generate Command",
+        color="green",
+        icon=viser.Icon.FILE_EXPORT,
+        hint="Generate the ns-render command for rendering the camera path.",
+    )
 
     @render_button.on_click
     def _(event: viser.GuiEvent) -> None:

@@ -901,12 +901,231 @@ class DatasetRender(BaseRender):
         CONSOLE.print(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
 
 
+@dataclass
+class RenderSingleFrame(BaseRender):
+    """Render a single frame and optionally capture a depth image."""
+
+    camera_pose: Annotated[
+        Optional[str],
+        tyro.conf.arg(
+            help="Camera pose in the format 'x,y,z,qx,qy,qz,qw' or 'x,y,z,rx,ry,rz' where rx,ry,rz are Euler angles in degrees"
+        ),
+    ] = None
+    camera_idx: Annotated[
+        Optional[int],
+        tyro.conf.arg(
+            help="Index of the train/eval camera to use. If specified, overrides camera_pose"
+        ),
+    ] = None
+    camera_fov: Annotated[
+        float,
+        tyro.conf.arg(
+            help="Field of view in degrees. Only used if camera_pose is specified"
+        ),
+    ] = 60.0
+    resolution: Annotated[
+        Optional[str],
+        tyro.conf.arg(
+            help="Resolution of the output image in format WxH, e.g., 1920x1080"
+        ),
+    ] = None
+    output_depth: Annotated[
+        bool,
+        tyro.conf.arg(
+            help="Whether to output depth image alongside RGB"
+        ),
+    ] = True
+    output_depth_exr: Annotated[
+        bool,
+        tyro.conf.arg(
+            help="Whether to save depth as OpenEXR file (requires OpenEXR package)"
+        ),
+    ] = False
+    output_normal: Annotated[
+        bool,
+        tyro.conf.arg(
+            help="Whether to output surface normal map"
+        ),
+    ] = False
+    output_path: Path = Path("renders/single_frame")
+    
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+        )
+        
+        install_checks.check_ffmpeg_installed()
+        
+        # Create output directory
+        output_path = self.output_path
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Add outputs we want to render
+        rendered_output_names = ["rgb"]
+        if self.output_depth:
+            rendered_output_names.append("depth")
+        if self.output_normal:
+            rendered_output_names.append("normal")
+        
+        # Get camera
+        if self.camera_idx is not None:
+            # Use a camera from the dataset
+            if isinstance(pipeline.datamanager, (VanillaDataManager, ParallelDataManager)):
+                camera, _ = pipeline.datamanager.eval_dataloader.get_camera(image_idx=self.camera_idx)
+            else:
+                CONSOLE.print("[bold red]ERROR: Cannot use camera_idx with this type of datamanager.")
+                return
+            camera = camera.to(pipeline.device)
+        elif self.camera_pose is not None:
+            # Create a camera from specified pose
+            try:
+                # Try to parse as position and quaternion
+                parts = [float(x) for x in self.camera_pose.split(",")]
+                if len(parts) == 7:  # x,y,z,qx,qy,qz,qw
+                    position = parts[:3]
+                    rotation = parts[3:]
+                    R = tf.quaternion_to_matrix(torch.tensor(rotation)).numpy()
+                elif len(parts) == 6:  # x,y,z,rx,ry,rz (Euler angles in degrees)
+                    position = parts[:3]
+                    euler_angles = [np.radians(angle) for angle in parts[3:]]
+                    R = tf.euler_angles_to_matrix(torch.tensor(euler_angles), "XYZ").numpy()
+                else:
+                    CONSOLE.print("[bold red]ERROR: Camera pose must be specified as 'x,y,z,qx,qy,qz,qw' or 'x,y,z,rx,ry,rz'.")
+                    return
+                
+                # Create transformation matrix
+                c2w = np.eye(4)
+                c2w[:3, :3] = R
+                c2w[:3, 3] = position
+                c2w = torch.from_numpy(c2w).float()
+                
+                # Parse resolution
+                if self.resolution:
+                    try:
+                        width, height = map(int, self.resolution.split("x"))
+                    except:
+                        CONSOLE.print("[bold red]ERROR: Resolution must be in format WxH, e.g., 1920x1080.")
+                        return
+                else:
+                    # Default resolution
+                    width, height = 800, 800
+                
+                # Create camera
+                camera_to_worlds = c2w.unsqueeze(0)
+                fov = self.camera_fov
+                camera = Cameras(
+                    camera_to_worlds=camera_to_worlds,
+                    fx=width / (2 * np.tan(np.radians(fov/2))),
+                    fy=height / (2 * np.tan(np.radians(fov/2))),
+                    cx=width / 2,
+                    cy=height / 2,
+                    width=width,
+                    height=height,
+                    camera_type=CameraType.PERSPECTIVE,
+                ).to(pipeline.device)
+            except Exception as e:
+                CONSOLE.print(f"[bold red]ERROR: Failed to create camera: {e}")
+                return
+        else:
+            # Default to first eval camera
+            if isinstance(pipeline.datamanager, (VanillaDataManager, ParallelDataManager)):
+                camera, _ = pipeline.datamanager.eval_dataloader.get_camera(image_idx=0)
+                camera = camera.to(pipeline.device)
+            else:
+                CONSOLE.print("[bold red]ERROR: No camera specified and cannot use default with this type of datamanager.")
+                return
+                
+        # Render the outputs
+        CONSOLE.print("[bold green]Rendering single frame...")
+        camera = camera.to(pipeline.device)
+        
+        with torch.no_grad():
+            outputs = pipeline.model.get_outputs_for_camera(camera=camera)
+            
+            # Save RGB image
+            rgb_output = outputs["rgb"].detach().cpu().numpy()
+            rgb_path = output_path / "rgb.png"
+            media.write_image(rgb_path, rgb_output, fmt="png")
+            CONSOLE.print(f"[bold green]RGB image saved to {rgb_path}")
+            
+            # Save depth image if requested
+            if self.output_depth and "depth" in outputs:
+                depth_image = colormaps.apply_depth_colormap(
+                    outputs["depth"],
+                    accumulation=outputs["accumulation"],
+                    near_plane=self.depth_near_plane,
+                    far_plane=self.depth_far_plane,
+                    colormap_options=self.colormap_options,
+                ).cpu().numpy()
+                depth_path = output_path / "depth_colored.png"
+                media.write_image(depth_path, depth_image, fmt="png")
+                
+                # Also save raw depth as NPY
+                raw_depth = outputs["depth"].cpu().numpy()
+                raw_depth_path = output_path / "depth_raw.npy"
+                np.save(raw_depth_path, raw_depth)
+                
+                # Save as OpenEXR if requested (16-bit float precision)
+                if self.output_depth_exr:
+                    try:
+                        import OpenEXR
+                        import Imath
+                        
+                        # OpenEXR expects different data format
+                        # Convert depth to float32 and ensure proper shape
+                        depth_data = outputs["depth"].cpu().numpy().astype(np.float32)
+                        height, width = depth_data.shape
+                        
+                        # Create header
+                        header = OpenEXR.Header(width, height)
+                        header['compression'] = Imath.Compression(Imath.Compression.ZIP_COMPRESSION)
+                        header['channels'] = {'Z': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))}
+                        
+                        # Create OpenEXR file
+                        depth_exr_path = output_path / "depth.exr"
+                        exr_file = OpenEXR.OutputFile(str(depth_exr_path), header)
+                        
+                        # Convert depth to string representation (required by OpenEXR)
+                        depth_data_str = depth_data.tobytes()
+                        
+                        # Write the data
+                        exr_file.writePixels({'Z': depth_data_str})
+                        exr_file.close()
+                        
+                        CONSOLE.print(f"[bold green]OpenEXR depth image saved to {depth_exr_path}")
+                    except ImportError:
+                        CONSOLE.print("[bold yellow]Warning: OpenEXR Python module not found. Skipping EXR output.")
+                        CONSOLE.print("[bold yellow]Install with: pip install OpenEXR")
+                
+                CONSOLE.print(f"[bold green]Depth images saved to {depth_path} and {raw_depth_path}")
+            
+            # Save normal map if requested
+            if self.output_normal and "normal" in outputs:
+                normal_output = outputs["normal"].detach().cpu().numpy()
+                # Convert normals from [-1, 1] to [0, 1] for visualization
+                normal_output = (normal_output + 1.0) / 2.0
+                normal_path = output_path / "normal.png"
+                media.write_image(normal_path, normal_output, fmt="png")
+                CONSOLE.print(f"[bold green]Normal map saved to {normal_path}")
+            elif self.output_normal and "normal_vis" in outputs:
+                normal_output = outputs["normal_vis"].detach().cpu().numpy()
+                normal_path = output_path / "normal.png"
+                media.write_image(normal_path, normal_output, fmt="png")
+                CONSOLE.print(f"[bold green]Normal map saved to {normal_path}")
+                
+        CONSOLE.print(f"[bold green]:tada: All outputs saved to {output_path} :tada:")
+
+
 Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[RenderCameraPath, tyro.conf.subcommand(name="camera-path")],
         Annotated[RenderInterpolated, tyro.conf.subcommand(name="interpolate")],
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
+        Annotated[RenderSingleFrame, tyro.conf.subcommand(name="single-frame")],
     ]
 ]
 
